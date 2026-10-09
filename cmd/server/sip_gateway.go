@@ -559,10 +559,19 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 		return // nenhum destino SIP: a chamada segue só para o painel web.
 	}
 
+	ac, found := sess.reg.get(callID)
+	if !found {
+		gw.log.Error("inbound: call not found in registry", "wa_call_id", callID)
+		return
+	}
+
 	rtpBridge, err := NewSIPRTPBridge(callID, "", gw.log)
 	if err != nil {
 		gw.log.Error("inbound: RTP bridge failed", "err", err)
 		return
+	}
+	rtpBridge.OnCapturedPCM = func(pcm []float32) {
+		ac.cm.FeedCapturedPCM(pcm)
 	}
 	sess.setRTPBridge(callID, rtpBridge)
 
