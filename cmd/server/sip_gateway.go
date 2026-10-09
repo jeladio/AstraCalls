@@ -46,6 +46,7 @@ func (r *sipRegistration) expired() bool {
 // inboundDialog representa uma chamada WhatsApp->SIP (somos o UAC).
 type inboundDialog struct {
 	dialog    *sipgo.DialogClientSession
+	leg       *inboundLeg
 	sessionID string
 	waCallID  string
 }
@@ -387,6 +388,8 @@ func (gw *SIPGateway) handleBye(req *sip.Request, tx sip.ServerTransaction) {
 
 	// BYE de uma chamada WhatsApp->SIP (somos o UAC): o softphone desligou.
 	if isInbound {
+		// o softphone já encerrou o diálogo: o OnEnded não deve responder com outro BYE.
+		inb.leg.markEnded()
 		_ = inb.dialog.ReadBye(req, tx)
 		if sess, ok := gw.sessions.Get(inb.sessionID); ok {
 			sess.terminateCallByID(inb.waCallID)
@@ -573,6 +576,33 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 	rtpBridge.OnCapturedPCM = func(pcm []float32) {
 		ac.cm.FeedCapturedPCM(pcm)
 	}
+
+	// O contexto do WaitAnswer e o OnEnded são criados ANTES de publicar a ponte e
+	// mandar o INVITE: se a chamada WhatsApp terminar a qualquer momento o OnEnded
+	// já existe (antes era atribuído dentro da goroutine, depois do INVITE).
+	waitCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	leg := newInboundLeg()
+
+	// Quando a chamada WhatsApp terminar: CANCEL se ainda tocando, BYE se já
+	// atendida — nunca os dois. Roda com o lock do CallManager (via emitState),
+	// então o BYE vai em goroutine para não travar a mídia.
+	rtpBridge.OnEnded = func(reason string) {
+		act := leg.end()
+		d, sipCallID := leg.dialogInfo()
+		switch act {
+		case legActionCancel:
+			cancel() // o WaitAnswer vê o contexto cancelado e manda o CANCEL
+		case legActionBye:
+			if d != nil {
+				go gw.sendInboundBye(d, sipCallID)
+			}
+		}
+		if sipCallID != "" {
+			gw.mu.Lock()
+			delete(gw.inboundDialogs, sipCallID)
+			gw.mu.Unlock()
+		}
+	}
 	sess.setRTPBridge(callID, rtpBridge)
 
 	localIP := getLocalIP()
@@ -590,31 +620,22 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 	d, err := gw.dialogUA.Invite(context.Background(), targetURI, []byte(sdpOffer), fromHDR, ct)
 	if err != nil {
 		gw.log.Error("inbound: INVITE failed", "err", err)
+		cancel()
 		sess.terminateCallByID(callID)
 		return
 	}
 
+	sipCallID := d.InviteRequest.CallID().Value()
+	leg.setDialog(d, sipCallID)
+
 	gw.log.Info("inbound: ringing SIP", "target", targetLabel, "peer", peerNumber, "wa_call_id", callID)
 
 	go func() {
-		waitCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		sipCallID := d.InviteRequest.CallID().Value()
-
-		// Quando a chamada WhatsApp terminar: cancela o INVITE (se ainda tocando)
-		// ou manda BYE (se já atendida).
-		rtpBridge.OnEnded = func(reason string) {
-			cancel()
-			byeCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
-			defer c()
-			_ = d.Bye(byeCtx)
-			gw.mu.Lock()
-			delete(gw.inboundDialogs, sipCallID)
-			gw.mu.Unlock()
-		}
-
 		if err := d.WaitAnswer(waitCtx, sipgo.AnswerOptions{}); err != nil {
+			// sem 2xx (recusa, timeout ou CANCEL nosso): não há mais nada a mandar.
+			leg.markEnded()
 			gw.log.Info("inbound: SIP not answered", "err", err)
 			sess.terminateCallByID(callID)
 			return
@@ -632,9 +653,21 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 			gw.log.Error("inbound: ACK failed", "err", err)
 		}
 
+		// markAnswered e o registro do diálogo ficam sob gw.mu: assim o OnEnded (que
+		// remove o diálogo depois de leg.end) nunca deixa uma entrada órfã no mapa.
 		gw.mu.Lock()
-		gw.inboundDialogs[sipCallID] = &inboundDialog{dialog: d, sessionID: sess.id, waCallID: callID}
+		answered := leg.markAnswered()
+		if answered {
+			gw.inboundDialogs[sipCallID] = &inboundDialog{dialog: d, leg: leg, sessionID: sess.id, waCallID: callID}
+		}
 		gw.mu.Unlock()
+		if !answered {
+			// a chamada WhatsApp terminou enquanto o 2xx chegava (cruzou com o
+			// CANCEL): o ACK já confirmou o diálogo, então encerra com BYE.
+			gw.log.Info("inbound: SIP answered after WhatsApp call ended, sending BYE", "sip_call_id", sipCallID, "wa_call_id", callID)
+			gw.sendInboundBye(d, sipCallID)
+			return
+		}
 
 		// Atende a chamada no WhatsApp -> áudio começa a fluir.
 		if ac, ok := sess.reg.get(callID); ok {
@@ -644,6 +677,15 @@ func (gw *SIPGateway) handleInboundCall(sess *Session, callID, peerNumber string
 		}
 		gw.log.Info("inbound: connected WhatsApp<->SIP", "sip_call_id", sipCallID, "wa_call_id", callID)
 	}()
+}
+
+// sendInboundBye encerra um diálogo WhatsApp->SIP já confirmado (2xx + ACK).
+func (gw *SIPGateway) sendInboundBye(d *sipgo.DialogClientSession, sipCallID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Bye(ctx); err != nil {
+		gw.log.Warn("inbound: BYE failed", "sip_call_id", sipCallID, "err", err)
+	}
 }
 
 // sipUserPart extrai a parte numérica (antes do @) de um JID do WhatsApp.
