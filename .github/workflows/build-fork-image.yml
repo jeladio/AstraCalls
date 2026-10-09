@@ -1,0 +1,100 @@
+name: Build imagem (fork)
+
+# Build manual da imagem Docker no fork jeladio/AstraCalls.
+#   - só roda por workflow_dispatch (nunca em push/tag/PR);
+#   - compila só linux/amd64 num runner x86 do GitHub;
+#   - publica APENAS em ghcr.io/jeladio/astracalls usando o GITHUB_TOKEN
+#     (sem credenciais do Docker Hub -> não tem como publicar em astraonline/astracalls);
+#   - não faz deploy nem acessa nenhum servidor.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch a compilar
+        type: choice
+        required: true
+        default: fix/audio-whatsapp-sip-v1.1.0
+        options:
+          - fix/audio-whatsapp-sip-v1.1.0
+      tag:
+        description: Tag da imagem (ex. fix-audio-v1.1.0)
+        type: string
+        required: true
+        default: fix-audio-v1.1.0
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-fork-image-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/jeladio/astracalls
+
+jobs:
+  build:
+    name: build (linux/amd64)
+    # trava de segurança: não roda em nenhum outro repositório (upstream ou outros forks)
+    if: github.repository == 'jeladio/AstraCalls'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Valida a tag da imagem
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "::error::Tag inválida: '$TAG'"
+            exit 1
+          fi
+          if [ "$TAG" = "latest" ]; then
+            echo "::error::Não use 'latest' neste workflow"
+            exit 1
+          fi
+
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - name: Commit compilado
+        id: rev
+        run: |
+          git log -1 --format='%H %s'
+          git submodule status
+          if [ ! -f opus_mlow/CMakeLists.txt ]; then
+            echo "::error::Submódulo opus_mlow não foi inicializado"
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            BUILD_REV=${{ steps.rev.outputs.sha }}
+            BUILD_VERSION=${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/jeladio/AstraCalls
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.tag }}
+            ${{ env.IMAGE }}:sha-${{ steps.rev.outputs.sha }}
+          push: true
+          cache-from: type=gha,scope=fork-amd64
+          cache-to: type=gha,mode=max,scope=fork-amd64
